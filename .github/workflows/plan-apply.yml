@@ -1,0 +1,198 @@
+name: Terraform Plan & Apply
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+  workflow_dispatch:
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    environment: sandbox
+    # Cancel a superseded plan on the same stack - a stale plan for an old push is
+    # worthless, and this keeps PR feedback fast.
+    concurrency:
+      group: sandbox-plan
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    outputs:
+      has-changes: ${{ steps.plan.outputs.exitcode == 2 }}
+    env:
+      ARM_USE_OIDC: true
+      ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.5"
+
+      - name: Terraform Format Check
+        id: fmt
+        continue-on-error: true
+        run: terraform fmt -check -recursive
+        working-directory: infra
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_BACKEND_STORAGE_ACCOUNT }}"
+        working-directory: infra
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -input=false -detailed-exitcode -out=tfplan | tee /tmp/plan_output.txt
+          plan_exit=${PIPESTATUS[0]}
+          echo "exitcode=$plan_exit" >> "$GITHUB_OUTPUT"
+          if [ "$plan_exit" -eq 1 ]; then
+            exit 1
+          fi
+        working-directory: infra
+
+      # Uploaded only when there's a real diff to apply - this is what lets the apply
+      # job consume the exact plan a human reviewed instead of re-deriving its own,
+      # which is the actual fix for "someone else's apply silently overwrites mine":
+      # `terraform apply <planfile>` natively refuses if the backend state moved since
+      # this plan was computed ("Saved plan is stale").
+      - name: Upload plan artifact
+        if: steps.plan.outputs.exitcode == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: infra/tfplan
+          retention-days: 5
+
+      - name: Parse Plan Changes
+        id: changes
+        if: steps.plan.outputs.exitcode == '2'
+        run: |
+          summary=$(sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' /tmp/plan_output.txt | grep -E '^Plan:' | tail -1 || true)
+          echo "add=$(echo "$summary" | grep -oP '\d+(?= to add)' || echo 0)" >> "$GITHUB_OUTPUT"
+          echo "change=$(echo "$summary" | grep -oP '\d+(?= to change)' || echo 0)" >> "$GITHUB_OUTPUT"
+          echo "destroy=$(echo "$summary" | grep -oP '\d+(?= to destroy)' || echo 0)" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## Terraform Plan" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.plan.outputs.exitcode }}" == "2" ]; then
+            echo "🔄 **Changes detected** — add ${{ steps.changes.outputs.add }} / change ${{ steps.changes.outputs.change }} / destroy ${{ steps.changes.outputs.destroy }}" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.plan.outputs.exitcode }}" == "0" ]; then
+            echo "✅ **No changes**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ **Error**" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Sticky comment (found-or-created by marker) so repeated pushes to the same PR
+      # update one comment instead of piling up a new one each time.
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && always() && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- terraform-plan -->';
+            const exitcode = '${{ steps.plan.outputs.exitcode }}';
+            const add = '${{ steps.changes.outputs.add }}';
+            const change = '${{ steps.changes.outputs.change }}';
+            const destroy = '${{ steps.changes.outputs.destroy }}';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            let body;
+            if (exitcode === '1') {
+              body = `❌ **Terraform Plan failed**\n\n[View run](${runUrl})`;
+            } else if (exitcode === '2') {
+              body = `🔄 **Terraform Plan**\n\n| Add | Change | Destroy |\n|:---:|:---:|:---:|\n| ${add} | ${change} | ${destroy} |\n\n[Full plan output](${runUrl})`;
+            } else {
+              body = `✅ **Terraform Plan**: no changes.\n\n[View run](${runUrl})`;
+            }
+            body = `${marker}\n${body}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body,
+              });
+            }
+
+  apply:
+    name: Terraform Apply
+    needs: plan
+    if: needs.plan.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    environment: sandbox-apply
+    # Queue rather than cancel: killing a real in-flight apply mid-execution is
+    # dangerous. A queued second apply's saved plan will very likely be stale by the
+    # time it runs (the first apply just changed state), so it gets natively rejected
+    # instead of silently reapplying an outdated diff.
+    concurrency:
+      group: sandbox-apply
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_USE_OIDC: true
+      ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.5"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_BACKEND_STORAGE_ACCOUNT }}"
+        working-directory: infra
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: infra
+
+      # No -auto-approve: applying a saved plan file is already non-interactive, and
+      # this *is* the exact plan that was approved at the gate above - not a fresh
+      # re-derivation. If the real state moved since the plan job ran, this fails with
+      # Terraform's native "Saved plan is stale" instead of silently applying a
+      # different diff than what was reviewed.
+      - name: Terraform Apply
+        run: terraform apply -input=false tfplan
+        working-directory: infra
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## Terraform Apply" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ job.status == 'success' && '✅ Applied successfully' || '❌ Apply failed' }}" >> "$GITHUB_STEP_SUMMARY"

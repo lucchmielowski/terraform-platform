@@ -1,0 +1,121 @@
+name: Drift Detect
+
+on:
+  schedule:
+    # Daily by default - lower this temporarily (e.g. "0 * * * *") while testing.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sandbox-drift-detect
+  cancel-in-progress: true
+
+jobs:
+  drift-check:
+    name: Terraform Drift Check
+    runs-on: ubuntu-latest
+    environment: sandbox
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      has-changes: ${{ steps.plan.outputs.exitcode == 2 }}
+    env:
+      ARM_USE_OIDC: true
+      ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.5"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_BACKEND_STORAGE_ACCOUNT }}"
+        working-directory: infra
+
+      # Read-only: no -out, this never feeds an apply. Only asks "does main's code
+      # still match the real state".
+      - name: Terraform Plan (read-only)
+        id: plan
+        run: |
+          terraform plan -input=false -detailed-exitcode | tee /tmp/plan_output.txt
+          plan_exit=${PIPESTATUS[0]}
+          echo "exitcode=$plan_exit" >> "$GITHUB_OUTPUT"
+          if [ "$plan_exit" -eq 1 ]; then
+            exit 1
+          fi
+        working-directory: infra
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ "${{ steps.plan.outputs.exitcode }}" == "2" ]; then
+            echo "## 🚨 Drift detected" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' /tmp/plan_output.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.plan.outputs.exitcode }}" == "0" ]; then
+            echo "## ✅ No drift" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ❌ Plan failed" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  notify:
+    name: Report drift as a GitHub issue
+    needs: drift-check
+    # Status function required: drift-check can fail (real plan error), and this job
+    # must still run to report that failure rather than silently skipping.
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Find-or-create / close the drift issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'Drift detected — terraform-platform';
+            const result = '${{ needs.drift-check.result }}';
+            const hasChanges = '${{ needs.drift-check.outputs.has-changes }}' === 'true';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'drift',
+            });
+            const existing = issues.find(i => i.title === title);
+
+            if (result === 'failure') {
+              const body = `Drift check failed to run.\n\n[View run](${runUrl})`;
+              if (existing) {
+                await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, body });
+              } else {
+                await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body, labels: ['drift'] });
+              }
+              return;
+            }
+
+            if (hasChanges) {
+              const body = `Terraform detected drift on the last scheduled check.\n\n[View run](${runUrl})`;
+              if (existing) {
+                await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, body });
+              } else {
+                await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body, labels: ['drift'] });
+              }
+            } else if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number,
+                body: `Resolved as of [this run](${runUrl}) — no drift detected.`,
+              });
+              await github.rest.issues.update({ owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, state: 'closed' });
+            }
