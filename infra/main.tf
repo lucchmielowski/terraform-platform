@@ -28,5 +28,6 @@ resource "azurerm_storage_account" "this" {
   tags = {
     purpose    = "terraform-platform-sandbox"
     managed_by = "terraform"
+    new_tag    = "test"
   }
 }
