@@ -39,11 +39,11 @@ Sticky comment (marker-based find-or-create/update) posted by the `plan` job via
 - **Concurrency**: push two commits to a PR in quick succession. The first `plan` run should show **cancelled** in the Actions tab, not queued or racing the second.
 - **Saved-plan staleness**: open a PR, let it plan, don't approve the apply yet. In another terminal, drift the resource out-of-band:
   ```bash
-  az storage account update --name <storage-account-name> --resource-group tfplatform-rg --set tags.manual=drift
+  az storage account update --name <storage-account-name> --resource-group tfplatform-rg --set tags.manual=out-of-band
   ```
   Now approve the apply. It should **fail** with Terraform's native `Saved plan is stale` error instead of silently applying.
 - **PR comment**: push a second commit to the same PR. The existing plan comment should update in place, not get duplicated.
-- **Drift detection**: after drifting the tag as above, run the **Drift Detect** workflow manually (`workflow_dispatch`). Confirm the job summary shows the drift and a GitHub issue labeled `drift` gets opened. Fix the drift (re-run the apply, or revert the tag by hand) and re-run drift-detect — the issue should get a closing comment and close automatically.
+- **Drift detection**: after drifting the tag as above, run the **Drift Detect** workflow manually (`workflow_dispatch`). Confirm the job summary shows the drift and a GitHub issue labeled `drift` gets opened. Fix the drift (re-run the apply, or revert the tag to `manual=drift`) and re-run drift-detect — the issue should get a closing comment and close automatically.
 
 ## Cost
 
