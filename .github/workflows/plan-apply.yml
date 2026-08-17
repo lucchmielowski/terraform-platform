@@ -39,6 +39,11 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.5"
+          # The default wrapper swallows the real `terraform` exit code (always
+          # returns 0 so it can capture stdout/stderr as step outputs), which
+          # breaks `-detailed-exitcode` here: `plan_exit=${PIPESTATUS[0]}` below
+          # would always read 0, even when the plan has changes.
+          terraform_wrapper: false
 
       - name: Terraform Format Check
         id: fmt
@@ -168,6 +173,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.5"
+          terraform_wrapper: false
 
       - name: Terraform Init
         run: |

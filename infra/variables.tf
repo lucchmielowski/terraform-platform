@@ -7,5 +7,5 @@ variable "name_prefix" {
 variable "location" {
   description = "Azure region for the mock resources"
   type        = string
-  default     = "westeurope"
+  default     = "northeurope"
 }
