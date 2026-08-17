@@ -20,6 +20,8 @@ jobs:
       id-token: write
     outputs:
       has-changes: ${{ steps.plan.outputs.exitcode == 2 }}
+      remediated: ${{ steps.remediate.outcome == 'success' }}
+      diff: ${{ steps.plan.outputs.diff }}
     env:
       ARM_USE_OIDC: true
       ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
@@ -42,23 +44,51 @@ jobs:
             -backend-config="storage_account_name=${{ vars.TF_BACKEND_STORAGE_ACCOUNT }}"
         working-directory: infra
 
-      # Read-only: no -out, this never feeds an apply. Only asks "does main's code
-      # still match the real state".
-      - name: Terraform Plan (read-only)
+      # -out is saved even though this is nominally "read-only": it's what lets the
+      # optional auto-remediate step below apply exactly this diff instead of a fresh
+      # (potentially different, TOCTOU-prone) re-plan.
+      - name: Terraform Plan
         id: plan
         run: |
-          terraform plan -input=false -detailed-exitcode | tee /tmp/plan_output.txt
+          terraform plan -input=false -detailed-exitcode -out=tfplan | tee /tmp/plan_output.txt
           plan_exit=${PIPESTATUS[0]}
           echo "exitcode=$plan_exit" >> "$GITHUB_OUTPUT"
+
+          # Multiline output, capped so a huge plan can't blow past GitHub's issue
+          # body size limit once this lands in the drift issue.
+          delimiter="diff_$(openssl rand -hex 8)"
+          {
+            echo "diff<<$delimiter"
+            sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' /tmp/plan_output.txt | head -c 50000
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
           if [ "$plan_exit" -eq 1 ]; then
             exit 1
           fi
         working-directory: infra
 
+      # Opt-in per environment via the DRIFT_AUTO_REMEDIATE environment variable — not
+      # a blanket default. In a dev-ish environment, drift is likely someone poking at
+      # a resource to test something, so silently re-applying to match `main` is a
+      # reasonable default. In anything closer to production, out-of-band drift is a
+      # signal worth a human (or Copilot, see below) actually looking at before
+      # anything auto-corrects it — so this should stay unset/false there.
+      - name: Auto-remediate (apply saved plan)
+        id: remediate
+        if: steps.plan.outputs.exitcode == '2' && vars.DRIFT_AUTO_REMEDIATE == 'true'
+        run: terraform apply -input=false tfplan
+        working-directory: infra
+
       - name: Job summary
         if: always()
         run: |
-          if [ "${{ steps.plan.outputs.exitcode }}" == "2" ]; then
+          if [ "${{ steps.plan.outputs.exitcode }}" == "2" ] && [ "${{ steps.remediate.outcome }}" == "success" ]; then
+            echo "## 🔧 Drift detected and auto-remediated" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' /tmp/plan_output.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.plan.outputs.exitcode }}" == "2" ]; then
             echo "## 🚨 Drift detected" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' /tmp/plan_output.txt >> "$GITHUB_STEP_SUMMARY"
@@ -72,20 +102,28 @@ jobs:
   notify:
     name: Report drift as a GitHub issue
     needs: drift-check
-    # Status function required: drift-check can fail (real plan error), and this job
-    # must still run to report that failure rather than silently skipping.
+    # Status function required: drift-check can fail (real plan/apply error), and this
+    # job must still run to report that failure rather than silently skipping.
     if: always()
     runs-on: ubuntu-latest
     permissions:
       issues: write
     steps:
-      - name: Find-or-create / close the drift issue
+      - name: Find-or-create / close / assign the drift issue
         uses: actions/github-script@v7
+        env:
+          # Passed via env, not interpolated straight into the script text below -
+          # this is raw plan output (tag/resource values can contain anything,
+          # including backticks or `${...}`), so it must not land inside the JS
+          # template literal source itself.
+          PLAN_DIFF: ${{ needs.drift-check.outputs.diff }}
         with:
           script: |
             const title = 'Drift detected — terraform-platform';
             const result = '${{ needs.drift-check.result }}';
             const hasChanges = '${{ needs.drift-check.outputs.has-changes }}' === 'true';
+            const remediated = '${{ needs.drift-check.outputs.remediated }}' === 'true';
+            const diff = process.env.PLAN_DIFF || '';
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
 
             const { data: issues } = await github.rest.issues.listForRepo({
@@ -97,7 +135,7 @@ jobs:
             const existing = issues.find(i => i.title === title);
 
             if (result === 'failure') {
-              const body = `Drift check failed to run.\n\n[View run](${runUrl})`;
+              const body = `Drift check or auto-remediation failed to run.\n\n[View run](${runUrl})`;
               if (existing) {
                 await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, body });
               } else {
@@ -106,14 +144,64 @@ jobs:
               return;
             }
 
+            // Auto-remediated: nothing for a human (or Copilot) to act on. Close out
+            // any open issue rather than leaving it dangling.
+            if (hasChanges && remediated) {
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number,
+                  body: `Drift detected and automatically re-applied to match \`main\` on [this run](${runUrl}).`,
+                });
+                await github.rest.issues.update({ owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, state: 'closed' });
+              }
+              return;
+            }
+
             if (hasChanges) {
-              const body = `Terraform detected drift on the last scheduled check.\n\n[View run](${runUrl})`;
+              const body = `Terraform detected drift on the last scheduled check.\n\n<details><summary>Plan diff</summary>\n\n\`\`\`\n${diff}\n\`\`\`\n\n</details>\n\n[View run](${runUrl})`;
+              let issueNumber;
               if (existing) {
                 await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, body });
+                issueNumber = existing.number;
               } else {
-                await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body, labels: ['drift'] });
+                const created = await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body, labels: ['drift'] });
+                issueNumber = created.data.number;
               }
-            } else if (existing) {
+
+              // REST assignees only accepts human collaborators - the Copilot coding
+              // agent is a bot actor, so it needs the GraphQL assignable-actors path.
+              // Gated on it actually being a suggested actor so this no-ops cleanly on
+              // a repo where the coding agent isn't enabled, instead of failing the run.
+              const suggested = await github.graphql(`
+                query($owner: String!, $repo: String!) {
+                  repository(owner: $owner, name: $repo) {
+                    id
+                    suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 25) {
+                      nodes { login __typename ... on Bot { id } }
+                    }
+                  }
+                }`, { owner: context.repo.owner, repo: context.repo.repo });
+              const copilot = suggested.repository.suggestedActors.nodes.find(a => a.login === 'copilot-swe-agent');
+
+              if (copilot) {
+                const issueNode = await github.graphql(`
+                  query($owner: String!, $repo: String!, $number: Int!) {
+                    repository(owner: $owner, name: $repo) {
+                      issue(number: $number) { id }
+                    }
+                  }`, { owner: context.repo.owner, repo: context.repo.repo, number: issueNumber });
+
+                await github.graphql(`
+                  mutation($assignableId: ID!, $actorIds: [ID!]!) {
+                    replaceActorsForAssignable(input: { assignableId: $assignableId, actorIds: $actorIds }) {
+                      clientMutationId
+                    }
+                  }`, { assignableId: issueNode.repository.issue.id, actorIds: [copilot.id] });
+              }
+              return;
+            }
+
+            if (existing) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number,
                 body: `Resolved as of [this run](${runUrl}) — no drift detected.`,
