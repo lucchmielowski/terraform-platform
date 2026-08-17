@@ -206,4 +206,4 @@ The storage account holding remote state can't be created by the Terraform it ba
 
 ## What's next
 
-Once the pipeline is live, see the main **[README](README.md)** — it tracks the actual failure modes this sandbox has been used to reproduce and fix, plus a checklist of mechanisms to exercise (concurrency, saved-plan staleness, PR comments, drift detection) and teardown/cost notes.
+Once the pipeline is live, see the main **[README](README.md)** — it covers why this sandbox exists, the four mechanisms it validates, how to exercise each one, and teardown/cost notes.

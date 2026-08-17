@@ -1,83 +1,50 @@
 # terraform-platform (sandbox)
 
-A minimal, personal sandbox to test Terraform CI mechanisms — saved-plan apply, per-stack concurrency, PR comments, scheduled drift detection — against a real GitHub Actions + Azure OIDC pipeline.
+A minimal, personal sandbox for validating a Terraform CI redesign before it lands in production. For first-time setup, see **[INSTALL.md](INSTALL.md)**.
 
-For first-time setup (bootstrapping remote state, OIDC trust, GitHub environments), see **[INSTALL.md](INSTALL.md)**.
+## Why this exists
 
-This README instead tracks the actual failure modes this sandbox has been used to reproduce and fix, one per use case. Each one was hit for real, diagnosed against the live pipeline, and fixed — this doubles as a regression checklist: if any of these come back, the fix is already written down.
+A bare-bones `terraform plan` + `apply` GitHub Actions pipeline (the kind you get by following the first tutorial you find) tends to carry the same four gaps:
 
-## Use case 1: `ARM_*` vars missing → "a Tenant ID must be configured when authenticating with OIDC"
+1. **No PR comments** — plan output only goes to the job's Step Summary; reviewers have to click into Actions to see what a PR would change.
+2. **No protection against a stale apply silently overwriting someone else's change** — `apply` independently re-derives its own plan from scratch instead of consuming what was actually reviewed at the `plan` step. Nothing stops it from applying a materially different diff than what a human approved, if the real state moved in between (e.g. someone else's apply landed in the gap).
+3. **State drift goes undetected** — no scheduled plan-only workflow, so real state can silently diverge from what `main` declares, with nobody finding out until the next incidental plan run.
+4. **No concurrency control** at the GitHub Actions level — only the backend's blob state lease serializes execution, which is a blocking wait/retry, not a visible queue. This directly compounds problem #2.
 
-**Symptom**: `terraform init`/plan fails immediately with `azurerm` complaining OIDC is missing a Tenant ID and Client ID.
+This repo is a small, low-stakes pipeline (`.github/workflows/plan-apply.yml` + `drift-detect.yml`) built to design and validate fixes for all four before applying the same pattern anywhere it'd actually be costly to get wrong.
 
-**Cause**: The `sandbox` / `sandbox-apply` GitHub environments had zero variables configured — `ARM_CLIENT_ID`, `ARM_TENANT_ID`, `ARM_SUBSCRIPTION_ID` all resolved to empty strings.
+## The four mechanisms being validated
 
-**Fix**: Set them as GitHub **environment variables** (not secrets — none of these are sensitive; the real access control is the federated credential trust + RBAC role assignment, not secrecy of an ID). See INSTALL.md step 4.
+### 1. Saved-plan apply (fixes #2)
+`plan` runs with `-out=tfplan` and uploads it as an artifact only when there's a real diff (`exitcode == 2`). `apply` downloads that exact artifact and runs `terraform apply tfplan` — no `-auto-approve`, no fresh re-plan. A saved plan file embeds the backend state's serial/lineage, so `terraform apply <planfile>` natively refuses with `Saved plan is stale` if the real state moved since the plan was computed. This is the actual fix: Terraform does the "fail closed if diverged" work for free.
 
-## Use case 2: Federated credential subject mismatch (immutable IDs)
+Residual risk, not eliminated: the saved plan file contains **unredacted** values for anything needed to compute the plan, including fields marked `sensitive` (that flag only redacts CLI/JSON display). Mitigated here by 5-day artifact retention, not removed.
 
-**Symptom**: `terraform init` fails with `AADSTS700213: No matching federated identity record found for presented assertion subject 'repo:owner@OWNER_ID/repo@REPO_ID:environment:sandbox'`.
+### 2. Per-stack concurrency (also fixes #2, defense in depth)
+Two job-level `concurrency:` blocks — `plan` cancels a superseded run (a stale plan for an old push is worthless, keeps PR feedback fast), `apply` queues instead of cancelling (killing a real in-flight infrastructure mutation mid-execution is dangerous). A queued second apply's saved plan will very likely be stale by the time it runs anyway, so mechanism #1 rejects it instead of silently reapplying an outdated diff.
 
-**Cause**: GitHub's OIDC token `sub` claim uses the immutable-ID format `repo:<owner_login>@<owner_id>/<repo_name>@<repo_id>:environment:<name>`, not the plain `repo:<owner>/<repo>:environment:<name>` format. A federated credential configured with the plain form never matches.
+### 3. PR comment with plan diff (fixes #1)
+Sticky comment (marker-based find-or-create/update) posted by the `plan` job via `actions/github-script`, carrying counts (add/change/destroy) and a link to the run — never the raw resource-level plan text inline, both because of GitHub's comment size limit and because a PR comment is far more visible/cacheable than a gated run log, so it should carry a summary + link, not full attribute values.
 
-**Fix**: Look up the real owner/repo IDs (`gh api repos/{owner}/{repo} -q '"owner=\(.owner.login)@\(.owner.id) repo=\(.name)@\(.id)"'`) and use them verbatim in the federated credential's `subject`.
+### 4. Scheduled drift detection (fixes #3)
+`drift-detect.yml` runs a read-only `terraform plan` (no `-out`, never feeds an apply) on a daily cron plus `workflow_dispatch`. A drifted or failed run opens (or comments on) a GitHub issue labeled `drift`; a clean run closes it. Scaling this to many stacks would mean one explicit named job per stack rather than a `strategy: matrix` — matrixed job outputs collapse to the last-completed instance, which would silently break an aggregating notify step that needs a result per stack.
 
-## Use case 3: Plan always reports "no changes", even when it isn't
+## Deliberately out of scope
 
-**Symptom**: The PR comment and job summary always say "✅ no changes", even on a plan that clearly shows `N to add` in the raw log.
-
-**Cause**: `hashicorp/setup-terraform` installs a wrapper script around the `terraform` binary by default (to expose `stdout`/`stderr`/`exitcode` as step outputs). The wrapper always exits `0` to the shell so it can finish writing its own outputs — which silently breaks any script relying on `terraform plan -detailed-exitcode`'s real exit code (`2` = changes). `plan_exit=${PIPESTATUS[0]}` reads the wrapper's `0`, never the real `2`.
-
-**Fix**: Set `terraform_wrapper: false` on every `hashicorp/setup-terraform` step that a script inspects the exit code of (`plan-apply.yml` × 2, `drift-detect.yml` × 1).
-
-## Use case 4: Stale/orphaned state lock after a cancelled run
-
-**Symptom**: `terraform init`/`plan` hangs on "Acquiring state lock..." for minutes, or later fails outright with `Error acquiring the state lock`.
-
-**Cause**: The `plan` job's concurrency group (`cancel-in-progress: true`) kills an in-flight run when a newer one supersedes it — including mid-lock-hold. The killed process never releases its lease on the state blob, leaving it orphaned. In the worse case the lease exists but its `terraformlockid` metadata is empty (a torn write), which `terraform force-unlock <id>` can't target at all since there's no ID to give it.
-
-**Fix**:
-- If the lock ID is known and metadata is intact: `terraform force-unlock <LOCK_ID>` (confirm nothing is genuinely still running first — check `gh run list`).
-- If metadata is empty/malformed: break the lease directly on the blob:
-  ```bash
-  KEY=$(az storage account keys list --account-name <STATE_SA> --resource-group <STATE_RG> --query "[0].value" -o tsv)
-  az storage blob lease break --account-name <STATE_SA> --container-name tfstate --blob-name terraform-platform.tfstate --account-key "$KEY"
-  ```
-
-**Known risk, not yet fixed**: this concurrency setup can strand a lock on every cancelled mid-flight run. Worth deciding whether to accept it (locks are always recoverable, as above) or add an explicit unlock/cleanup step.
-
-## Use case 5: Pre-existing resource not in state ("already exists")
-
-**Symptom**: `terraform apply` fails with `a resource with the ID ".../resourceGroups/tfplatform-rg" already exists - to be managed via Terraform this resource needs to be imported into the State.`
-
-**Cause**: The resource group existed in Azure (created out-of-band — e.g. by hand during OIDC bootstrap, see INSTALL.md step 2) but was never recorded in Terraform's state.
-
-**Fix**: Confirm the real resource is empty/safe to adopt (`az resource list --resource-group <rg> -o table`), then bring it under management:
-```bash
-terraform import azurerm_resource_group.this /subscriptions/<sub>/resourceGroups/<rg>
-```
-
-## Use case 6: Import succeeds, but plan now wants to destroy+recreate anyway
-
-**Symptom**: After importing, `terraform plan` shows `# azurerm_resource_group.this must be replaced` with `location` as the forcing attribute.
-
-**Cause**: The real resource was created in a different region than the Terraform config's `variables.tf` default. Resource group location is immutable — any mismatch forces a destroy-and-recreate, not an in-place update.
-
-**Fix**: Decide which side is correct — usually cheaper to make the config match reality (`variables.tf` default) than to destroy/recreate real infrastructure. Always read the full plan before approving; "must be replaced" on anything non-empty is a stop-and-check moment, not a rubber-stamp.
+- **Resource-tag-based provenance tracking** — dropped in favor of GitHub Environment deployment history, which already answers "which branch/run last applied here" for free.
+- **Locking down which branch can approve an apply** — apply-from-branch is treated here as intentional, allowed behavior; the mechanisms above make an approved apply *consistent with what was reviewed*, they don't change *who* can approve it or *from where*.
 
 ## Things to try
 
-Once the pipeline is healthy end-to-end, these exercise the four mechanisms this sandbox exists to validate:
-
 - **Concurrency**: push two commits to a PR in quick succession. The first `plan` run should show **cancelled** in the Actions tab, not queued or racing the second.
-- **Saved-plan staleness (the actual "lock" fix)**: open a PR, let it plan, don't approve the apply yet. In another terminal, drift the resource out-of-band:
+- **Saved-plan staleness**: open a PR, let it plan, don't approve the apply yet. In another terminal, drift the resource out-of-band:
   ```bash
   az storage account update --name <storage-account-name> --resource-group tfplatform-rg --set tags.manual=drift
   ```
-  Now approve the apply. It should **fail** with Terraform's native `Saved plan is stale` error instead of silently applying — that's the mechanism that prevents "someone else's apply erasing my reviewed changes."
+  Now approve the apply. It should **fail** with Terraform's native `Saved plan is stale` error instead of silently applying.
 - **PR comment**: push a second commit to the same PR. The existing plan comment should update in place, not get duplicated.
 - **Drift detection**: after drifting the tag as above, run the **Drift Detect** workflow manually (`workflow_dispatch`). Confirm the job summary shows the drift and a GitHub issue labeled `drift` gets opened. Fix the drift (re-run the apply, or revert the tag by hand) and re-run drift-detect — the issue should get a closing comment and close automatically.
 
 ## Cost
 
-Resource group: free. Two `Standard_LRS` storage accounts (state + mock resource) with negligible data: a few cents a month combined. See INSTALL.md's "Cost" section for teardown commands.
+Resource group: free. Two `Standard_LRS` storage accounts (state + mock resource) with negligible data: a few cents a month combined. See INSTALL.md's teardown commands when you're done.
