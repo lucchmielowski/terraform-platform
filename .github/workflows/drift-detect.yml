@@ -109,7 +109,8 @@ jobs:
     permissions:
       issues: write
     steps:
-      - name: Find-or-create / close / assign the drift issue
+      - name: Find-or-create / close the drift issue
+        id: issue
         uses: actions/github-script@v7
         env:
           # Passed via env, not interpolated straight into the script text below -
@@ -167,38 +168,8 @@ jobs:
                 const created = await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body, labels: ['drift'] });
                 issueNumber = created.data.number;
               }
-
-              // REST assignees only accepts human collaborators - the Copilot coding
-              // agent is a bot actor, so it needs the GraphQL assignable-actors path.
-              // Gated on it actually being a suggested actor so this no-ops cleanly on
-              // a repo where the coding agent isn't enabled, instead of failing the run.
-              const suggested = await github.graphql(`
-                query($owner: String!, $repo: String!) {
-                  repository(owner: $owner, name: $repo) {
-                    id
-                    suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 25) {
-                      nodes { login __typename ... on Bot { id } }
-                    }
-                  }
-                }`, { owner: context.repo.owner, repo: context.repo.repo });
-              core.info(`suggestedActors: ${JSON.stringify(suggested.repository.suggestedActors.nodes)}`);
-              const copilot = suggested.repository.suggestedActors.nodes.find(a => a.login === 'copilot-swe-agent');
-
-              if (copilot) {
-                const issueNode = await github.graphql(`
-                  query($owner: String!, $repo: String!, $number: Int!) {
-                    repository(owner: $owner, name: $repo) {
-                      issue(number: $number) { id }
-                    }
-                  }`, { owner: context.repo.owner, repo: context.repo.repo, number: issueNumber });
-
-                await github.graphql(`
-                  mutation($assignableId: ID!, $actorIds: [ID!]!) {
-                    replaceActorsForAssignable(input: { assignableId: $assignableId, actorIds: $actorIds }) {
-                      clientMutationId
-                    }
-                  }`, { assignableId: issueNode.repository.issue.id, actorIds: [copilot.id] });
-              }
+              core.setOutput('issue-number', issueNumber);
+              core.setOutput('should-assign', 'true');
               return;
             }
 
@@ -209,3 +180,48 @@ jobs:
               });
               await github.rest.issues.update({ owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, state: 'closed' });
             }
+
+      # Separate step, separate (narrower-blast-radius) token: the default
+      # GITHUB_TOKEN's suggestedActors list does not include the Copilot coding
+      # agent - it's tied to an actual Copilot-licensed human identity, not the
+      # ephemeral Actions bot. COPILOT_ASSIGN_TOKEN is a PAT scoped to Issues
+      # read/write on this repo only, belonging to a Copilot-licensed user.
+      - name: Assign Copilot to the drift issue
+        if: steps.issue.outputs.should-assign == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.COPILOT_ASSIGN_TOKEN }}
+          script: |
+            const issueNumber = Number('${{ steps.issue.outputs.issue-number }}');
+
+            // Gated on Copilot actually appearing as a suggested actor so this
+            // no-ops cleanly (rather than failing the run) if the coding agent
+            // isn't enabled, or the token turns out not to have visibility into it.
+            const suggested = await github.graphql(`
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 25) {
+                    nodes { login __typename ... on Bot { id } }
+                  }
+                }
+              }`, { owner: context.repo.owner, repo: context.repo.repo });
+            core.info(`suggestedActors: ${JSON.stringify(suggested.repository.suggestedActors.nodes)}`);
+            const copilot = suggested.repository.suggestedActors.nodes.find(a => a.login === 'copilot-swe-agent');
+            if (!copilot) {
+              core.warning('Copilot coding agent not found in suggestedActors - skipping assignment.');
+              return;
+            }
+
+            const issueNode = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $number) { id }
+                }
+              }`, { owner: context.repo.owner, repo: context.repo.repo, number: issueNumber });
+
+            await github.graphql(`
+              mutation($assignableId: ID!, $actorIds: [ID!]!) {
+                replaceActorsForAssignable(input: { assignableId: $assignableId, actorIds: $actorIds }) {
+                  clientMutationId
+                }
+              }`, { assignableId: issueNode.repository.issue.id, actorIds: [copilot.id] });
