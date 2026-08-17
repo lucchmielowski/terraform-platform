@@ -159,7 +159,19 @@ jobs:
             }
 
             if (hasChanges) {
-              const body = `Terraform detected drift on the last scheduled check.\n\n<details><summary>Plan diff</summary>\n\n\`\`\`\n${diff}\n\`\`\`\n\n</details>\n\n[View run](${runUrl})`;
+              // This body is Copilot's task brief once it's assigned below - not just
+              // a human-facing report. It can only act via PRs against this repo, it
+              // has no cloud credentials to fix live infra directly, so the brief has
+              // to spell out the one decision that actually matters and what to do
+              // for each branch, not just dump the diff and assume intent is obvious.
+              const instructions = [
+                '**What we need from you:**',
+                '1. Look at the plan diff below to see exactly what changed out-of-band (outside of a Terraform apply).',
+                '2. Decide: does this look like an intentional change that should become the new desired state, or an accidental/unauthorized one that should be reverted?',
+                '3. **If it should become the new desired state**: open a PR updating the relevant resource(s) in `infra/*.tf` so a fresh `terraform plan` shows no diff against the drifted values. Reference this issue in the PR.',
+                "4. **If it looks accidental and should be reverted**: don't change any `.tf` files — they already declare the correct state. Instead, comment on this issue explaining your reasoning, so a human can re-run `terraform apply` (or enable `DRIFT_AUTO_REMEDIATE` for this environment) to put it back. You have no credentials to apply against the real cloud environment yourself.",
+              ].join('\n');
+              const body = `Terraform detected drift on the last scheduled check.\n\n${instructions}\n\n<details><summary>Plan diff</summary>\n\n\`\`\`\n${diff}\n\`\`\`\n\n</details>\n\n[View run](${runUrl})`;
               let issueNumber;
               if (existing) {
                 await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, body });
