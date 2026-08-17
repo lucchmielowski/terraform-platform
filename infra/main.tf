@@ -21,7 +21,7 @@ resource "azurerm_storage_account" "this" {
 
   account_tier             = "Standard"
   account_replication_type = "LRS"
-  min_tls_version          = "TLS1_2"
+  min_tls_version          = "TLS1_0"
 
   # Edit this tag by hand (`az storage account update --set tags.manual=drift`) to
   # simulate out-of-band drift for the drift-detect workflow.
