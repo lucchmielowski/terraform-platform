@@ -23,8 +23,6 @@ resource "azurerm_storage_account" "this" {
   account_replication_type = "LRS"
   min_tls_version          = "TLS1_2"
 
-  # Edit this tag by hand (`az storage account update --set tags.manual=drift`) to
-  # simulate out-of-band drift for the drift-detect workflow.
   tags = {
     purpose    = "terraform-platform-sandbox"
     managed_by = "terraform"
